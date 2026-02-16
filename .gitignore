@@ -38,10 +38,12 @@ env/
 
 # Project specific
 cache/
+code/
 *.log
 *.db
 *.sqlite
 *.sqlite3
+code_analysis_*.json
 
 # Environment variables
 .env

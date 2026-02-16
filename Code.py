@@ -13,10 +13,11 @@ AliceProjectの全コードを解析し、品質向上の提案を行います
 import ast
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
+import re
 
 
 @dataclass
@@ -41,10 +42,21 @@ class CodeMetrics:
     classes: int
     complexity: int
     maintainability_index: float
+    max_function_length: int
+    imports_count: int
 
 
 class CodeAnalyzer:
     """コード解析クラス（高性能版）"""
+    
+    # 動的に設定可能なしきい値
+    THRESHOLDS = {
+        'max_line_length': 120,
+        'max_function_length': 50,
+        'max_complexity': 20,
+        'min_maintainability': 50,
+        'max_function_params': 5,
+    }
     
     def __init__(self, project_root: Path):
         """
@@ -57,6 +69,8 @@ class CodeAnalyzer:
         self.issues: List[CodeIssue] = []
         self.metrics: List[CodeMetrics] = []
         self.analysis_result = {}
+        self.output_dir = project_root / "code"
+        self.output_dir.mkdir(exist_ok=True)
     
     def analyze_project(self) -> Dict[str, Any]:
         """
@@ -70,19 +84,37 @@ class CodeAnalyzer:
         print("=" * 70)
         
         # Pythonファイルを取得
-        py_files = list(self.project_root.rglob("*.py"))
-        py_files = [f for f in py_files if "venv" not in str(f) and "__pycache__" not in str(f)]
+        py_files = self._get_python_files()
         
-        print(f"\n📁 解析対象: {len(py_files)} ファイル\n")
+        print(f"\n📁 解析対象: {len(py_files)} ファイル")
+        print(f"📂 出力ディレクトリ: {self.output_dir}\n")
         
         for py_file in py_files:
-            print(f"  分析中: {py_file.relative_to(self.project_root)}")
+            print(f"  📄 分析中: {py_file.relative_to(self.project_root)}")
             self._analyze_file(py_file)
         
         # 結果をまとめる
         self._generate_report()
         
         return self.analysis_result
+    
+    def _get_python_files(self) -> List[Path]:
+        """
+        解析対象のPythonファイルを取得
+        
+        Returns:
+            Pythonファイルのリスト
+        """
+        py_files = list(self.project_root.rglob("*.py"))
+        # 除外パターン
+        exclude_patterns = ['venv', '__pycache__', '.git', 'build', 'dist']
+        
+        filtered_files = []
+        for f in py_files:
+            if not any(pattern in str(f) for pattern in exclude_patterns):
+                filtered_files.append(f)
+        
+        return sorted(filtered_files)
     
     def _analyze_file(self, file_path: Path):
         """
@@ -124,17 +156,23 @@ class CodeAnalyzer:
         blank_lines = len([l for l in lines if not l.strip()])
         
         # AST解析
+        functions = 0
+        classes = 0
+        complexity = 0
+        max_func_length = 0
+        imports = 0
+        
         try:
             tree = ast.parse(content)
             functions = len([n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)])
             classes = len([n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)])
             complexity = self._calculate_complexity(tree)
-        except:
-            functions = 0
-            classes = 0
-            complexity = 0
+            max_func_length = self._get_max_function_length(tree)
+            imports = len([n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))])
+        except SyntaxError:
+            pass
         
-        # 保守性指標（簡易版）
+        # 保守性指標
         maintainability = self._calculate_maintainability(loc, complexity, comment_lines)
         
         return CodeMetrics(
@@ -145,12 +183,14 @@ class CodeAnalyzer:
             functions=functions,
             classes=classes,
             complexity=complexity,
-            maintainability_index=maintainability
+            maintainability_index=maintainability,
+            max_function_length=max_func_length,
+            imports_count=imports
         )
     
     def _calculate_complexity(self, tree: ast.AST) -> int:
         """
-        循環的複雑度を計算（簡易版）
+        循環的複雑度を計算（McCabe複雑度）
         
         Args:
             tree: ASTツリー
@@ -165,12 +205,34 @@ class CodeAnalyzer:
                 complexity += 1
             elif isinstance(node, ast.BoolOp):
                 complexity += len(node.values) - 1
+            elif isinstance(node, (ast.And, ast.Or)):
+                complexity += 1
         
         return complexity
     
+    def _get_max_function_length(self, tree: ast.AST) -> int:
+        """
+        最大関数長を取得
+        
+        Args:
+            tree: ASTツリー
+            
+        Returns:
+            最大関数長
+        """
+        max_length = 0
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                if hasattr(node, 'end_lineno'):
+                    length = node.end_lineno - node.lineno
+                    max_length = max(max_length, length)
+        
+        return max_length
+    
     def _calculate_maintainability(self, loc: int, complexity: int, comments: int) -> float:
         """
-        保守性指標を計算
+        保守性指標を計算（Maintainability Index）
         
         Args:
             loc: コード行数
@@ -183,11 +245,18 @@ class CodeAnalyzer:
         if loc == 0:
             return 100.0
         
-        # 簡易的な計算式
-        comment_ratio = comments / loc if loc > 0 else 0
-        complexity_penalty = min(complexity / 10, 1.0)
+        # コメント率
+        comment_ratio = (comments / loc) if loc > 0 else 0
         
-        score = 100 - (complexity_penalty * 30) + (comment_ratio * 10)
+        # 複雑度ペナルティ（正規化）
+        complexity_penalty = min(complexity / 50, 1.0)
+        
+        # コード量ペナルティ（大きすぎるファイル）
+        size_penalty = min(loc / 1000, 1.0) * 0.5
+        
+        # 保守性スコア計算
+        score = 100 - (complexity_penalty * 40) - (size_penalty * 20) + (comment_ratio * 15)
+        
         return max(0.0, min(100.0, score))
     
     def _detect_issues(self, file_path: Path, content: str):
@@ -201,59 +270,135 @@ class CodeAnalyzer:
         lines = content.split('\n')
         rel_path = str(file_path.relative_to(self.project_root))
         
-        # 長い関数の検出
+        # AST解析による問題検出
         try:
             tree = ast.parse(content)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef):
-                    func_lines = node.end_lineno - node.lineno if hasattr(node, 'end_lineno') else 0
-                    if func_lines > 50:
+            self._detect_ast_issues(tree, rel_path)
+        except SyntaxError as e:
+            self.issues.append(CodeIssue(
+                file=rel_path,
+                line=e.lineno if e.lineno else 0,
+                severity="critical",
+                category="syntax",
+                message=f"構文エラー: {e.msg}",
+                suggestion="構文を修正してください"
+            ))
+        
+        # テキストベースの問題検出
+        self._detect_text_issues(lines, rel_path)
+    
+    def _detect_ast_issues(self, tree: ast.AST, rel_path: str):
+        """
+        ASTベースの問題検出
+        
+        Args:
+            tree: ASTツリー
+            rel_path: 相対パス
+        """
+        for node in ast.walk(tree):
+            # 長い関数
+            if isinstance(node, ast.FunctionDef):
+                if hasattr(node, 'end_lineno'):
+                    func_lines = node.end_lineno - node.lineno
+                    if func_lines > self.THRESHOLDS['max_function_length']:
                         self.issues.append(CodeIssue(
                             file=rel_path,
                             line=node.lineno,
                             severity="medium",
                             category="complexity",
-                            message=f"関数 '{node.name}' が長すぎます ({func_lines}行)",
-                            suggestion="関数を小さな関数に分割することを検討してください"
+                            message=f"関数 '{node.name}' が長すぎます ({func_lines}行 > {self.THRESHOLDS['max_function_length']}行)",
+                            suggestion=f"関数を{self.THRESHOLDS['max_function_length']}行以内に分割してください"
                         ))
-        except:
-            pass
+                
+                # 引数が多すぎる関数
+                num_args = len(node.args.args)
+                if num_args > self.THRESHOLDS['max_function_params']:
+                    self.issues.append(CodeIssue(
+                        file=rel_path,
+                        line=node.lineno,
+                        severity="medium",
+                        category="design",
+                        message=f"関数 '{node.name}' の引数が多すぎます ({num_args}個)",
+                        suggestion="引数をオブジェクトにまとめることを検討してください"
+                    ))
+            
+            # 深いネスト
+            if isinstance(node, (ast.If, ast.For, ast.While)):
+                nest_level = self._get_nesting_level(node)
+                if nest_level > 3:
+                    self.issues.append(CodeIssue(
+                        file=rel_path,
+                        line=node.lineno,
+                        severity="high",
+                        category="complexity",
+                        message=f"ネストが深すぎます (レベル {nest_level})",
+                        suggestion="早期リターンや関数分割でネストを減らしてください"
+                    ))
+    
+    def _get_nesting_level(self, node: ast.AST, level: int = 0) -> int:
+        """
+        ネストレベルを計算
         
-        # 行の長さチェック
+        Args:
+            node: ASTノード
+            level: 現在のレベル
+            
+        Returns:
+            最大ネストレベル
+        """
+        max_level = level
+        
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.If, ast.For, ast.While, ast.With)):
+                child_level = self._get_nesting_level(child, level + 1)
+                max_level = max(max_level, child_level)
+        
+        return max_level
+    
+    def _detect_text_issues(self, lines: List[str], rel_path: str):
+        """
+        テキストベースの問題検出
+        
+        Args:
+            lines: ファイル行リスト
+            rel_path: 相対パス
+        """
         for i, line in enumerate(lines, 1):
-            if len(line) > 120:
+            # 行の長さチェック
+            if len(line) > self.THRESHOLDS['max_line_length']:
                 self.issues.append(CodeIssue(
                     file=rel_path,
                     line=i,
                     severity="low",
                     category="style",
-                    message=f"行が長すぎます ({len(line)}文字)",
-                    suggestion="行を120文字以内に収めることを推奨します"
+                    message=f"行が長すぎます ({len(line)}文字 > {self.THRESHOLDS['max_line_length']}文字)",
+                    suggestion=f"行を{self.THRESHOLDS['max_line_length']}文字以内に分割してください"
                 ))
-        
-        # TODO コメントの検出
-        for i, line in enumerate(lines, 1):
-            if "TODO" in line or "FIXME" in line or "HACK" in line:
+            
+            # TODOコメント
+            if re.search(r'\b(TODO|FIXME|HACK|XXX)\b', line):
                 self.issues.append(CodeIssue(
                     file=rel_path,
                     line=i,
                     severity="low",
                     category="todo",
-                    message="TODO/FIXME/HACKコメントが残っています",
+                    message="TODO/FIXME/HACK/XXXコメントが残っています",
                     suggestion="対応予定の作業を計画してください"
                 ))
-        
-        # print文の検出（デバッグ用）
-        for i, line in enumerate(lines, 1):
-            if line.strip().startswith("print(") and "# debug" not in line.lower():
-                self.issues.append(CodeIssue(
-                    file=rel_path,
-                    line=i,
-                    severity="low",
-                    category="debug",
-                    message="デバッグ用のprint文が残っている可能性があります",
-                    suggestion="ロガーを使用するか、不要であれば削除してください"
-                ))
+            
+            # デバッグprint文（ただしロギングは除外）
+            stripped = line.strip()
+            if stripped.startswith("print(") and "logger" not in line.lower() and "log" not in line.lower():
+                # ユーザー向けメッセージは除外
+                if not any(keyword in line for keyword in ["===", "---", "✅", "❌", "📊", "💡"]):
+                    self.issues.append(CodeIssue(
+                        file=rel_path,
+                        line=i,
+                        severity="low",
+                        category="debug",
+                        message="デバッグ用のprint文が残っている可能性があります",
+                        suggestion="ロガーを使用するか、不要であれば削除してください"
+                    ))
     
     def _generate_report(self):
         """解析レポートを生成"""
@@ -265,13 +410,17 @@ class CodeAnalyzer:
         total_loc = sum(m.lines_of_code for m in self.metrics)
         total_functions = sum(m.functions for m in self.metrics)
         total_classes = sum(m.classes for m in self.metrics)
+        total_imports = sum(m.imports_count for m in self.metrics)
         avg_maintainability = sum(m.maintainability_index for m in self.metrics) / len(self.metrics) if self.metrics else 0
+        max_complexity = max((m.complexity for m in self.metrics), default=0)
         
         print(f"\n📈 コードメトリクス:")
         print(f"  総コード行数: {total_loc:,}")
         print(f"  関数数: {total_functions}")
         print(f"  クラス数: {total_classes}")
+        print(f"  Import数: {total_imports}")
         print(f"  平均保守性指標: {avg_maintainability:.1f}/100")
+        print(f"  最大複雑度: {max_complexity}")
         
         # 問題サマリー
         severity_counts = {
@@ -282,28 +431,41 @@ class CodeAnalyzer:
         }
         
         print(f"\n⚠️  検出された問題:")
-        print(f"  Critical: {severity_counts['critical']}")
-        print(f"  High:     {severity_counts['high']}")
-        print(f"  Medium:   {severity_counts['medium']}")
-        print(f"  Low:      {severity_counts['low']}")
-        print(f"  合計:     {len(self.issues)}")
+        print(f"  🔴 Critical: {severity_counts['critical']}")
+        print(f"  🟠 High:     {severity_counts['high']}")
+        print(f"  🟡 Medium:   {severity_counts['medium']}")
+        print(f"  🟢 Low:      {severity_counts['low']}")
+        print(f"  📊 合計:     {len(self.issues)}")
         
-        # 詳細な問題リスト
-        if self.issues:
-            print(f"\n📋 問題詳細（上位10件）:")
-            for issue in sorted(self.issues, key=lambda x: ["low", "medium", "high", "critical"].index(x.severity), reverse=True)[:10]:
+        # 重要な問題のみ表示
+        critical_and_high = [i for i in self.issues if i.severity in ["critical", "high"]]
+        medium_issues = [i for i in self.issues if i.severity == "medium"]
+        
+        if critical_and_high:
+            print(f"\n🚨 Critical/High問題:")
+            for issue in critical_and_high[:5]:
                 print(f"\n  [{issue.severity.upper()}] {issue.file}:{issue.line}")
-                print(f"    {issue.message}")
+                print(f"    📝 {issue.message}")
+                print(f"    💡 {issue.suggestion}")
+        
+        if medium_issues and not critical_and_high:
+            print(f"\n⚠️  Medium問題（上位5件）:")
+            for issue in medium_issues[:5]:
+                print(f"\n  [{issue.severity.upper()}] {issue.file}:{issue.line}")
+                print(f"    📝 {issue.message}")
                 print(f"    💡 {issue.suggestion}")
         
         # 結果を辞書に保存
         self.analysis_result = {
             "timestamp": datetime.now().isoformat(),
+            "thresholds": self.THRESHOLDS,
             "summary": {
                 "total_loc": total_loc,
                 "total_functions": total_functions,
                 "total_classes": total_classes,
-                "avg_maintainability": avg_maintainability
+                "total_imports": total_imports,
+                "avg_maintainability": round(avg_maintainability, 2),
+                "max_complexity": max_complexity
             },
             "issues": {
                 "total": len(self.issues),
@@ -324,7 +486,10 @@ class CodeAnalyzer:
             出力ファイルパス
         """
         if output_path is None:
-            output_path = self.project_root / "code_analysis_report.json"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = self.output_dir / f"code_analysis_{timestamp}.json"
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(self.analysis_result, f, ensure_ascii=False, indent=2)
@@ -341,24 +506,31 @@ class CodeAnalyzer:
         """
         recommendations = []
         
-        # メトリクスベースの提案
-        for metric in self.metrics:
-            if metric.maintainability_index < 50:
-                recommendations.append(
-                    f"📉 {metric.file}: 保守性が低いです。リファクタリングを検討してください"
-                )
-            
-            if metric.complexity > 20:
-                recommendations.append(
-                    f"🔄 {metric.file}: 複雑度が高いです。関数を分割してください"
-                )
-        
-        # 問題ベースの提案
+        # Critical/High問題
         critical_issues = [i for i in self.issues if i.severity == "critical"]
+        high_issues = [i for i in self.issues if i.severity == "high"]
+        
         if critical_issues:
             recommendations.append(
-                f"🚨 Critical問題が{len(critical_issues)}件あります。最優先で対応してください"
+                f"🚨 Critical問題が{len(critical_issues)}件あります。即座に対応してください"
             )
+        
+        if high_issues:
+            recommendations.append(
+                f"🔴 High問題が{len(high_issues)}件あります。優先的に対応してください"
+            )
+        
+        # メトリクスベースの提案
+        for metric in self.metrics:
+            if metric.maintainability_index < self.THRESHOLDS['min_maintainability']:
+                recommendations.append(
+                    f"📉 {metric.file}: 保守性が低いです ({metric.maintainability_index:.1f}/100)"
+                )
+            
+            if metric.complexity > self.THRESHOLDS['max_complexity']:
+                recommendations.append(
+                    f"🔄 {metric.file}: 複雑度が高いです ({metric.complexity} > {self.THRESHOLDS['max_complexity']})"
+                )
         
         return recommendations
 
@@ -383,6 +555,10 @@ def main():
         print("=" * 70)
         for rec in recommendations:
             print(f"  {rec}")
+    else:
+        print("\n" + "=" * 70)
+        print("✨ コード品質は良好です！")
+        print("=" * 70)
     
     print("\n" + "=" * 70)
     print("✅ 解析完了")
