@@ -44,7 +44,7 @@ AliceProject/
 ### 1. 仮想環境の作成
 ```bash
 cd AliceProject
-python3.11 -m venv venvAlice
+python -m venv venvAlice
 ```
 
 ### 2. 仮想環境の有効化
@@ -104,7 +104,7 @@ python library_manager.py upgrade-pip
 ## 使用技術
 - **GUI**: Tkinter
 - **AI画像生成**: Stable Diffusion XL (Hugging Face)
-- **音声認識**: Whisper Base (OpenAI)
+- **音声認識**: Whisper Base (OpenAI) →　VOCEBOX(変更予定)
 - **テキスト解析**: BERT Multilingual
 - **感情検出**: DistilRoBERTa
 - **チャットモデル**: Claude Sonnet 4 (claude-sonnet-4-20250514)
